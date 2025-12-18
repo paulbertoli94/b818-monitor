@@ -6,10 +6,10 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from huawei_lte_api.Connection import Connection
 from huawei_lte_api.api.Monitoring import Monitoring
 
-ROUTER_HOST = os.getenv("ROUTER_HOST", "192.168.1.1")
+ROUTER_HOST = os.getenv("ROUTER_HOST", "")
 ROUTER_USER = os.getenv("ROUTER_USER", "")
 ROUTER_PASSWORD = os.getenv("ROUTER_PASSWORD", "")
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", ""))
 
 app = FastAPI()
 
