@@ -8,9 +8,9 @@ services:
     ports:
       - "8088:8088"
     environment:
-      ROUTER_HOST: "192.168.1.1"
+      ROUTER_HOST: ""
       ROUTER_USER: ""
       ROUTER_PASSWORD: ""
-      POLL_SECONDS: "1"
+      POLL_SECONDS: ""
     command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8088"]
     restart: unless-stopped
