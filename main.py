@@ -1,7 +1,10 @@
+import json
 import os
+import struct
 import time
+import zlib
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from huawei_lte_api.Connection import Connection
 from huawei_lte_api.api.Monitoring import Monitoring
@@ -12,6 +15,64 @@ ROUTER_PASSWORD = os.getenv("ROUTER_PASSWORD", "")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", ""))
 
 app = FastAPI()
+
+APP_NAME = "Vodafone FWA Monitor"
+PWA_BG_COLOR = "#050915"
+PWA_THEME_COLOR = "#0f172a"
+ICON_SIZES = {32, 180, 192, 512}
+
+SW_JS = """
+const CACHE_NAME = 'vodafone-fwa-monitor-v1';
+const APP_SHELL = ['/', '/manifest.webmanifest', '/icon-180.png', '/icon-192.png', '/icon-512.png'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL)).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((key) => key !== CACHE_NAME).map((key) => caches.delete(key)))
+    ).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+
+  const url = new URL(request.url);
+  if (url.pathname.startsWith('/api/')) {
+    event.respondWith(fetch(request));
+    return;
+  }
+
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request).then((response) => {
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put('/', copy));
+        return response;
+      }).catch(() => caches.match('/') || caches.match(request))
+    );
+    return;
+  }
+
+  event.respondWith(
+    caches.match(request).then((cached) => {
+      if (cached) return cached;
+      return fetch(request).then((response) => {
+        if (!response || response.status !== 200 || response.type === 'opaque') return response;
+        const copy = response.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+        return response;
+      });
+    })
+  );
+});
+""".strip()
 
 # Stato per calcolare velocità (delta byte / delta tempo)
 _last = {
@@ -118,6 +179,47 @@ def _human_mbps(bps: float) -> float:
     # Mbps decimali (base 10) per allineare ai contatori della maggior parte delle linee
     return round(bps / 1_000_000, 2)
 
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack("!I", len(data))
+        + tag
+        + data
+        + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    )
+
+def _generate_icon_png(size: int) -> bytes:
+    bg = (229, 27, 35, 255)
+    fg = (255, 255, 255, 255)
+    rows = []
+    baseline = int(size * 0.76)
+    bar_width = max(10, size // 10)
+    gap = max(8, size // 18)
+    left = (size - (bar_width * 3 + gap * 2)) // 2
+    heights = [0.20, 0.36, 0.52]
+
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            pixel = bg
+            for index, height_ratio in enumerate(heights):
+                x0 = left + index * (bar_width + gap)
+                x1 = x0 + bar_width
+                y0 = baseline - int(size * height_ratio)
+                if x0 <= x < x1 and y0 <= y < baseline:
+                    pixel = fg
+                    break
+            row.extend(pixel)
+        rows.append(bytes(row))
+
+    raw = b"".join(rows)
+    ihdr = struct.pack("!IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    return b"".join([
+        b"\x89PNG\r\n\x1a\n",
+        _png_chunk(b"IHDR", ihdr),
+        _png_chunk(b"IDAT", zlib.compress(raw, level=9)),
+        _png_chunk(b"IEND", b""),
+    ])
+
 @app.get("/api/speed")
 def api_speed():
     rx, tx, raw = _get_stats()
@@ -130,6 +232,39 @@ def api_speed():
         "raw": raw,  # utile per debug: puoi toglierlo dopo
     })
 
+@app.get("/manifest.webmanifest")
+def manifest():
+    payload = {
+        "name": APP_NAME,
+        "short_name": "FWA Monitor",
+        "description": "Monitor live della velocita Vodafone FWA installabile su telefono e desktop.",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": PWA_BG_COLOR,
+        "theme_color": PWA_THEME_COLOR,
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    }
+    return Response(content=json.dumps(payload), media_type="application/manifest+json")
+
+@app.get("/sw.js")
+def service_worker():
+    return Response(
+        content=SW_JS,
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/"},
+    )
+
+@app.get("/icon-{size}.png")
+def app_icon(size: int):
+    if size not in ICON_SIZES:
+        return Response(status_code=404)
+    return Response(content=_generate_icon_png(size), media_type="image/png")
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(f"""
@@ -138,7 +273,18 @@ def home():
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Vodafone FWA Monitor</title>
+  <title>{APP_NAME}</title>
+  <meta name="application-name" content="{APP_NAME}"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="FWA Monitor"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="theme-color" content="{PWA_THEME_COLOR}"/>
+  <meta name="description" content="Monitor live della velocita Vodafone FWA con installazione PWA su telefono e desktop."/>
+  <link rel="manifest" href="/manifest.webmanifest"/>
+  <link rel="apple-touch-icon" href="/icon-180.png"/>
+  <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png"/>
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"/>
   <style>
     :root {{
       color-scheme: dark;
@@ -241,6 +387,7 @@ def home():
       transform: translateY(-1px);
       box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
     }}
+    .toggle-btn[hidden] {{ display: none; }}
     .card {{
       padding: 20px 22px;
       border-radius: 18px;
@@ -287,6 +434,26 @@ def home():
       opacity: 0.9;
     }}
     .foot.hide {{ opacity: 0; transition: opacity 0.2s ease; }}
+    @media (max-width: 720px) {{
+      body {{
+        padding: 16px;
+        align-items: stretch;
+      }}
+      .headline {{
+        flex-direction: column;
+        align-items: stretch;
+      }}
+      .actions {{
+        justify-content: space-between;
+        flex-wrap: wrap;
+      }}
+      .card {{
+        padding: 18px;
+      }}
+      .big {{
+        font-size: 30px;
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -298,6 +465,7 @@ def home():
       </div>
       <div class="actions">
         <div class="muted">Router: {ROUTER_HOST}</div>
+        <button class="toggle-btn" id="installBtn" hidden>Installa app</button>
         <button class="toggle-btn" id="themeToggle" title="Cambia tema">🌙</button>
       </div>
     </div>
