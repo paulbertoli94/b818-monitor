@@ -9,9 +9,11 @@ Piccola applicazione FastAPI per leggere le statistiche di traffico da un router
 
 ## Avvio locale con Docker Compose
 
-Aggiorna le variabili nel file `docker-compose.yml` oppure passale da ambiente, poi avvia:
+Compila il file `.env` partendo da `.env.example`, poi avvia:
 
 ```bash
+cp .env
+# aggiorna ROUTER_HOST / ROUTER_PASSWORD se necessario
 docker compose up --build
 ```
 
@@ -59,7 +61,7 @@ Per usare direttamente l'immagine pubblicata:
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-## Variabili ambiente
+## Variabili ambiente (`.env`)
 
 - `ROUTER_HOST`: indirizzo del router, ad esempio `192.168.8.1`
 - `ROUTER_USER`: username del router, se richiesto

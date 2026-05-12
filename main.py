@@ -12,7 +12,7 @@ from huawei_lte_api.api.Monitoring import Monitoring
 ROUTER_HOST = os.getenv("ROUTER_HOST", "")
 ROUTER_USER = os.getenv("ROUTER_USER", "")
 ROUTER_PASSWORD = os.getenv("ROUTER_PASSWORD", "")
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", ""))
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
 
 app = FastAPI()
 
@@ -455,7 +455,13 @@ def home():
     @media (max-width: 720px) {{
       body {{
         padding: 16px;
-        align-items: stretch;
+        align-items: center;
+      }}
+      .shell {{
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        min-height: calc(100vh - 32px);
       }}
       .headline {{
         flex-direction: column;
