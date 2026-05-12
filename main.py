@@ -74,6 +74,19 @@ self.addEventListener('fetch', (event) => {
 });
 """.strip()
 
+FAVICON_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1d4ed8"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+  <text x="32" y="41" text-anchor="middle" font-size="30">📡</text>
+</svg>
+""".strip()
+
 # Stato per calcolare velocità (delta byte / delta tempo)
 _last = {
     "ts": None,
@@ -265,6 +278,10 @@ def app_icon(size: int):
         return Response(status_code=404)
     return Response(content=_generate_icon_png(size), media_type="image/png")
 
+@app.get("/favicon.svg")
+def favicon():
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     return HTMLResponse(f"""
@@ -283,6 +300,7 @@ def home():
   <meta name="description" content="Monitor live della velocita Vodafone FWA con installazione PWA su telefono e desktop."/>
   <link rel="manifest" href="/manifest.webmanifest"/>
   <link rel="apple-touch-icon" href="/icon-180.png"/>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
   <link rel="icon" type="image/png" sizes="32x32" href="/icon-32.png"/>
   <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png"/>
   <style>
@@ -492,6 +510,17 @@ const maxPoints = Math.max(10, Math.floor(180000 / pollMs)); // ~3 minuti di sto
 const history = [];
 let timer = null;
 let paused = false;
+let deferredInstallPrompt = null;
+
+function isStandalone() {{
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}}
+
+function updateInstallButton() {{
+  const btn = document.getElementById('installBtn');
+  if (!btn) return;
+  btn.hidden = isStandalone() || deferredInstallPrompt === null;
+}}
 
 function applyTheme(theme) {{
   document.body.classList.toggle('light', theme === 'light');
@@ -508,6 +537,39 @@ if (toggleEl) {{
   toggleEl.addEventListener('click', () => {{
     const next = document.body.classList.contains('light') ? 'dark' : 'light';
     applyTheme(next);
+  }});
+}}
+
+const installBtn = document.getElementById('installBtn');
+if (installBtn) {{
+  installBtn.addEventListener('click', async () => {{
+    if (!deferredInstallPrompt) return;
+    deferredInstallPrompt.prompt();
+    try {{
+      await deferredInstallPrompt.userChoice;
+    }} finally {{
+      deferredInstallPrompt = null;
+      updateInstallButton();
+    }}
+  }});
+}}
+
+window.addEventListener('beforeinstallprompt', (event) => {{
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  updateInstallButton();
+}});
+
+window.addEventListener('appinstalled', () => {{
+  deferredInstallPrompt = null;
+  updateInstallButton();
+}});
+
+if ('serviceWorker' in navigator) {{
+  window.addEventListener('load', () => {{
+    navigator.serviceWorker.register('/sw.js').catch((error) => {{
+      console.error('service worker registration failed', error);
+    }});
   }});
 }}
 
@@ -635,6 +697,8 @@ document.addEventListener('visibilitychange', () => {{
     resumePolling();
   }}
 }});
+
+updateInstallButton();
 </script>
 </body>
 </html>
