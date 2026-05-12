@@ -58,13 +58,9 @@ docker buildx inspect --bootstrap
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t ghcr.io/paulbertoli94/b818-monitor:latest \
-  --push .
-```
-
-4. Verifica che il manifest pubblicato contenga entrambe le architetture:
-
-```bash
-docker buildx imagetools inspect ghcr.io/paulbertoli94/b818-monitor:latest
+  --push \
+  --provenance=false \
+  --sbom=false .
 ```
 
 ## Avvio con immagine pubblicata
