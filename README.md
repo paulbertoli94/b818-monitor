@@ -9,7 +9,7 @@ Piccola applicazione FastAPI per leggere le statistiche di traffico da un router
 
 ## Avvio locale con Docker Compose
 
-Compila il file `.env` partendo da `.env.example`, poi avvia:
+Configura il file `.env`, poi avvia:
 
 ```bash
 cp .env
@@ -35,22 +35,36 @@ docker build -t fwa-monitor:latest .
 
 L'esempio di produzione usa GHCR con immagine `ghcr.io/paulbertoli94/b818-monitor:latest`.
 
+Se fai la build da Apple Silicon (`arm64`) e poi pubblichi direttamente con `docker build` + `docker push`, l'immagine risultante puo contenere solo `linux/arm64`. Un server Intel/AMD64 o Portainer su `linux/amd64` non riuscira quindi ad avviarla.
+
+Per produzione pubblica sempre una build multi-arch con `buildx`.
+
 1. Login al registry:
 
 ```bash
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
 ```
 
-2. Build dell'immagine con il tag del registry:
+2. Crea e seleziona un builder `buildx` se non esiste gia:
 
 ```bash
-docker build -t ghcr.io/paulbertoli94/b818-monitor:latest .
+docker buildx create --name multiarch --use
+docker buildx inspect --bootstrap
 ```
 
-3. Push dell'immagine:
+3. Build e push multi-arch:
 
 ```bash
-docker push ghcr.io/paulbertoli94/b818-monitor:latest
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/paulbertoli94/b818-monitor:latest \
+  --push .
+```
+
+4. Verifica che il manifest pubblicato contenga entrambe le architetture:
+
+```bash
+docker buildx imagetools inspect ghcr.io/paulbertoli94/b818-monitor:latest
 ```
 
 ## Avvio con immagine pubblicata
