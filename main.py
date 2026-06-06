@@ -1,18 +1,23 @@
 import json
 import os
+from datetime import datetime, timezone
 import struct
 import time
 import zlib
-from fastapi import FastAPI
+import re
+from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from huawei_lte_api.Connection import Connection
+from huawei_lte_api.api.Device import Device
+from huawei_lte_api.api.Net import Net
 from huawei_lte_api.api.Monitoring import Monitoring
 
 ROUTER_HOST = os.getenv("ROUTER_HOST", "")
 ROUTER_USER = os.getenv("ROUTER_USER", "")
 ROUTER_PASSWORD = os.getenv("ROUTER_PASSWORD", "")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "1"))
+ROUTER_TIMEOUT = float(os.getenv("ROUTER_TIMEOUT", "3"))
 
 app = FastAPI()
 
@@ -22,7 +27,7 @@ PWA_THEME_COLOR = "#0f172a"
 ICON_SIZES = {32, 180, 192, 512}
 
 SW_JS = """
-const CACHE_NAME = 'vodafone-fwa-monitor-v1';
+const CACHE_NAME = 'vodafone-fwa-monitor-v3';
 const APP_SHELL = ['/', '/manifest.webmanifest', '/icon-180.png', '/icon-192.png', '/icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -103,13 +108,13 @@ def _get_stats():
 
     # Se non hai password, prova senza login (molti firmware lo permettono)
     if not ROUTER_PASSWORD:
-        with Connection(url) as conn:
+        with Connection(url, timeout=ROUTER_TIMEOUT) as conn:
             mon = Monitoring(conn)
             s = mon.traffic_statistics()
             return _extract_rx_tx(s), _extract_rx_tx(s, upload=True), s
 
     # Altrimenti usa login
-    with Connection(url, username=ROUTER_USER or None, password=ROUTER_PASSWORD) as conn:
+    with Connection(url, username=ROUTER_USER or None, password=ROUTER_PASSWORD, timeout=ROUTER_TIMEOUT) as conn:
         mon = Monitoring(conn)
         s = mon.traffic_statistics()
         return _extract_rx_tx(s), _extract_rx_tx(s, upload=True), s
@@ -140,6 +145,152 @@ def _extract_rate(s: dict, upload: bool = False) -> float | None:
         except Exception:
             continue
     return None
+
+def _safe_dict(payload) -> dict:
+    return payload if isinstance(payload, dict) else {}
+
+def _pick(payload: dict, *names):
+    if not isinstance(payload, dict):
+        return None
+    normalized = {}
+    for key, value in payload.items():
+        if key is None:
+            continue
+        k = str(key)
+        normalized[k] = value
+        normalized[k.lower()] = value
+        normalized[re.sub(r"[^a-z0-9]", "", k.lower())] = value
+
+    for name in names:
+        for candidate in (str(name), str(name).lower(), re.sub(r"[^a-z0-9]", "", str(name).lower())):
+            value = normalized.get(candidate)
+            if value is None or str(value) == "":
+                continue
+            return str(value).strip()
+    return None
+
+def _norm_antenna(value):
+    if value is None or str(value).strip() == "":
+        return "--"
+    return "EXT" if str(value).strip() == "1" else "INT"
+
+def _decode_lte_bands(mask):
+    if mask is None:
+        return ""
+    raw = str(mask).strip()
+    if not raw:
+        return ""
+    if raw.upper() == "AUTO":
+        return "AUTO"
+    try:
+        value = int(raw, 16)
+    except ValueError:
+        if raw.isdigit():
+            value = int(raw, 10)
+        else:
+            return ""
+    if value <= 0:
+        return ""
+    return "+".join([f"B{i + 1}" for i in range(90) if (value & (1 << i))])
+
+def _parse_enbid(cell_id):
+    if cell_id is None:
+        return None
+    value = str(cell_id).strip()
+    if not value:
+        return None
+    if "-" in value:
+        left = value.split("-", 1)[0]
+        try:
+            return str(int(left))
+        except ValueError:
+            return None
+    try:
+        number = int(value)
+    except ValueError:
+        return None
+    hex_value = f"{number:x}"
+    if len(hex_value) <= 2:
+        return None
+    base = hex_value[:-2]
+    if not base:
+        return None
+    try:
+        return str(int(base, 16))
+    except ValueError:
+        return None
+
+def _normalize_plmn(plmn, enbid):
+    if plmn is None:
+        return None
+    p = str(plmn).strip()
+    if p == "22201":
+        return "2221"
+    if p == "22299":
+        return "22288"
+    if p == "22250" and enbid is not None and len(str(enbid)) == 6:
+        return "22288"
+    return p
+
+def _signal_payload(router_password: str | None = None):
+    if not ROUTER_HOST:
+        return {"error": "ROUTER_HOST non configurato", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    url = f"http://{ROUTER_HOST}/"
+    password = router_password or ROUTER_PASSWORD or None
+    partial_errors = {}
+    try:
+        with Connection(url, username=ROUTER_USER or None, password=password, timeout=ROUTER_TIMEOUT) as conn:
+            monitor = Monitoring(conn)
+            net = Net(conn)
+            device = Device(conn)
+
+            def read_part(name, fn):
+                try:
+                    return _safe_dict(fn())
+                except Exception as exc:
+                    partial_errors[name] = str(exc)
+                    return {}
+
+            raw_signal = read_part("signal", device.signal)
+            raw_antenna = read_part("antenna_type", device.antenna_type)
+            raw_net_mode = read_part("net_mode", net.net_mode)
+            raw_status = read_part("status", monitor.status)
+    except Exception as exc:
+        return {"error": str(exc), "timestamp": datetime.now(timezone.utc).isoformat()}
+
+    enbid = _parse_enbid(_pick(raw_signal, "cell_id", "cell-id", "cellid"))
+    plmn = _pick(raw_signal, "plmn")
+    lte_band = _pick(raw_net_mode, "LTEBand", "lteband")
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "rsrp": _pick(raw_signal, "rsrp"),
+        "rsrq": _pick(raw_signal, "rsrq"),
+        "sinr": _pick(raw_signal, "sinr"),
+        "rssi": _pick(raw_signal, "rssi"),
+        "nrrsrp": _pick(raw_signal, "nrrsrp"),
+        "nrrsrq": _pick(raw_signal, "nrrsrq"),
+        "nrsinr": _pick(raw_signal, "nrsinr"),
+        "dlbandwidth": _pick(raw_signal, "dlbandwidth", "dlBandwidth", "dl_bandwidth"),
+        "ulbandwidth": _pick(raw_signal, "ulbandwidth", "ulBandwidth", "ul_bandwidth"),
+        "band": _pick(raw_signal, "band"),
+        "cell_id": _pick(raw_signal, "cell_id", "cell-id", "cellid"),
+        "plmn": plmn,
+        "enbid": enbid,
+        "mode": "4G+" if _pick(raw_status, "CurrentNetworkTypeEx") == "1011" else "--",
+        "signal_icon": _pick(raw_status, "SignalIcon"),
+        "signal_strength": _pick(raw_status, "SignalStrength"),
+        "antenna1": _norm_antenna(_pick(raw_antenna, "antenna1type", "antenna1Type")),
+        "antenna2": _norm_antenna(_pick(raw_antenna, "antenna2type", "antenna2Type")),
+        "allowed": _decode_lte_bands(lte_band),
+        "lteitaly": f"https://lteitaly.it/internal/map.php#bts={_normalize_plmn(plmn, enbid)}.{enbid}" if enbid else None,
+        "raw_signal": raw_signal,
+        "raw_antenna": raw_antenna,
+        "raw_net_mode": raw_net_mode,
+        "raw_status": raw_status,
+        "partial_errors": partial_errors,
+    }
 
 def _update_rates(rx, tx, router_rx_rate: float | None = None, router_tx_rate: float | None = None):
     now = time.time()
@@ -235,15 +386,28 @@ def _generate_icon_png(size: int) -> bytes:
 
 @app.get("/api/speed")
 def api_speed():
-    rx, tx, raw = _get_stats()
-    _update_rates(rx, tx, _extract_rate(raw), _extract_rate(raw, upload=True))
-    return JSONResponse({
-        "router": ROUTER_HOST,
-        "download_mbps": _human_mbps(_last["rx_rate_smooth"]),
-        "upload_mbps": _human_mbps(_last["tx_rate_smooth"]),
-        "poll_seconds": POLL_SECONDS,
-        "raw": raw,  # utile per debug: puoi toglierlo dopo
-    })
+    try:
+        rx, tx, raw = _get_stats()
+        _update_rates(rx, tx, _extract_rate(raw), _extract_rate(raw, upload=True))
+        return JSONResponse({
+            "router": ROUTER_HOST,
+            "download_mbps": _human_mbps(_last["rx_rate_smooth"]),
+            "upload_mbps": _human_mbps(_last["tx_rate_smooth"]),
+            "poll_seconds": POLL_SECONDS,
+            "raw": raw,  # utile per debug: puoi toglierlo dopo
+        })
+    except Exception as exc:
+        return JSONResponse({
+            "router": ROUTER_HOST,
+            "download_mbps": None,
+            "upload_mbps": None,
+            "poll_seconds": POLL_SECONDS,
+            "error": str(exc),
+        })
+
+@app.get("/api/signal")
+def api_signal(x_router_password: str | None = Header(default=None)):
+    return JSONResponse(_signal_payload(x_router_password))
 
 @app.get("/manifest.webmanifest")
 def manifest():
@@ -406,6 +570,8 @@ def home():
       box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
     }}
     .toggle-btn[hidden] {{ display: none; }}
+    .install-row {{ display: flex; justify-content: flex-end; margin-top: 8px; }}
+    .install-row .toggle-btn {{ font-size: 11px; padding: 4px 8px; opacity: 0.78; }}
     .card {{
       padding: 20px 22px;
       border-radius: 18px;
@@ -430,6 +596,45 @@ def home():
     .line.dl {{ stroke: url(#gradDl); }}
     .line.ul {{ stroke: url(#gradUl); }}
     .label {{ fill: #94a3b8; font-size: 10px; text-anchor: end; }}
+    .signal-grid {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }}
+    .signal-strip {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; color: var(--legend); font-size: 12px; }}
+    .signal-strip b {{ color: var(--text); font-weight: 700; }}
+    .signal-strip a {{ color: var(--pill-text); text-decoration: none; font-weight: 700; }}
+    .signal-strip a:hover {{ text-decoration: underline; }}
+    .kv {{ border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: rgba(255,255,255,0.02); min-width: 0; }}
+    .kv[data-metric] {{ cursor: pointer; }}
+    .kv[data-metric]:hover {{ border-color: var(--pill-border); background: var(--pill-bg); }}
+    .kv .lbl {{ font-size: 11px; color: var(--small); margin-bottom: 4px; }}
+    .kv .val {{ font-weight: 800; font-size: 18px; color: var(--text); margin-bottom: 5px; }}
+    .kv .val a {{ color: var(--pill-text); text-decoration: none; }}
+    .kv .val a:hover {{ text-decoration: underline; }}
+    .signal-tools {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0 6px 0; }}
+    .signal-tools .toggle-btn {{ border: 1px solid var(--border); border-radius: 10px; padding: 5px 10px; font-size: 12px; }}
+    .signal-tools .toggle-btn.active {{ background: var(--pill-bg); border-color: var(--pill-border); color: var(--pill-text); }}
+    .radio-actions {{ justify-content: flex-start; margin-top: 12px; }}
+    .radio-actions .toggle-btn {{ opacity: 1; }}
+    .radio-actions .toggle-btn.secondary {{ opacity: 0.72; }}
+    .network-badge {{ display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--pill-border); border-radius: 999px; padding: 5px 10px; background: var(--pill-bg); color: var(--text); font-size: 12px; font-weight: 800; }}
+    .network-bars {{ color: #34d399; letter-spacing: 1px; }}
+    .login-state {{ color: var(--small); font-size: 12px; min-height: 16px; margin-top: 8px; }}
+    .radio-panel[hidden] {{ display: none; }}
+    .signal-chart {{ width: 100%; height: 36px; }}
+    .signal-chart svg {{ width: 100%; height: 100%; }}
+    .sig-hidden {{ display: none !important; }}
+    .signal-legend {{ margin-top: 4px; display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--legend); flex-wrap: wrap; }}
+    .signal-legend-dot {{ width: 10px; height: 10px; border-radius: 50%; display: inline-block; }}
+    .signal-legend-dot.ok {{ background: #22c55e; }}
+    .signal-legend-dot.warn {{ background: #eab308; }}
+    .signal-legend-dot.bad {{ background: #f97316; }}
+    .metric-modal {{ position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 18px; background: rgba(2, 6, 23, 0.72); }}
+    .metric-modal[hidden] {{ display: none; }}
+    .metric-panel {{ width: min(900px, 100%); border: 1px solid var(--border); border-radius: 10px; background: #0f172a; box-shadow: 0 28px 80px rgba(0,0,0,0.45); padding: 16px; }}
+    body.light .metric-panel {{ background: #ffffff; }}
+    .metric-head {{ display: flex; justify-content: space-between; gap: 12px; align-items: start; margin-bottom: 12px; }}
+    .metric-title {{ font-size: 18px; font-weight: 800; }}
+    .metric-stats {{ display: flex; gap: 12px; flex-wrap: wrap; color: var(--legend); font-size: 12px; margin-top: 4px; }}
+    .metric-stats b {{ color: var(--text); }}
+    #metricChart {{ width: 100%; height: 320px; display: block; }}
     .status {{
       padding: 6px 10px;
       border-radius: 10px;
@@ -477,6 +682,9 @@ def home():
       .big {{
         font-size: 30px;
       }}
+      .signal-grid {{
+        grid-template-columns: 1fr;
+      }}
     }}
   </style>
 </head>
@@ -489,7 +697,7 @@ def home():
       </div>
       <div class="actions">
         <div class="muted">Router: {ROUTER_HOST}</div>
-        <button class="toggle-btn" id="installBtn" hidden>Installa app</button>
+        <span class="network-badge" id="networkBadge" hidden><span id="sig-network-mode">—</span><span class="network-bars" id="sig-bars">—</span></span>
         <button class="toggle-btn" id="themeToggle" title="Cambia tema">🌙</button>
       </div>
     </div>
@@ -506,17 +714,99 @@ def home():
         </div>
       </div>
       <div class="small">Intervallo: {POLL_SECONDS}s</div>
+      <div class="signal-tools">
+        <button class="toggle-btn" id="showRadioBtn" type="button">Mostra dati radio</button>
+      </div>
+      <div class="radio-panel" id="radioPanel" hidden>
+        <div class="signal-tools radio-actions" id="signalTools">
+          <button class="toggle-btn" id="hideRadioBtn" type="button">Nascondi</button>
+          <button class="toggle-btn secondary" id="routerForgetBtn" type="button">Dimentica accesso</button>
+        </div>
+        <div class="login-state" id="routerLoginState">Dati radio pronti.</div>
+        <div class="signal-grid" id="signalSummary">
+          <div class="kv signal-optional sig-lte-only" data-metric="rsrp">
+            <div class="lbl">RSRP</div>
+            <div class="val" id="sig-rsrp">—</div>
+            <div class="signal-chart" id="chart-rsrp"></div>
+          </div>
+          <div class="kv signal-optional sig-lte-only" data-metric="rsrq">
+            <div class="lbl">RSRQ</div>
+            <div class="val" id="sig-rsrq">—</div>
+            <div class="signal-chart" id="chart-rsrq"></div>
+          </div>
+          <div class="kv signal-optional sig-lte-only" data-metric="sinr">
+            <div class="lbl">SINR</div>
+            <div class="val" id="sig-sinr">—</div>
+            <div class="signal-chart" id="chart-sinr"></div>
+          </div>
+          <div class="kv signal-optional sig-nr-only" data-metric="nrrsrp">
+            <div class="lbl">NR RSRP</div>
+            <div class="val" id="sig-nrrsrp">—</div>
+            <div class="signal-chart" id="chart-nrrsrp"></div>
+          </div>
+          <div class="kv signal-optional sig-nr-only" data-metric="nrrsrq">
+            <div class="lbl">NR RSRQ</div>
+            <div class="val" id="sig-nrrsrq">—</div>
+            <div class="signal-chart" id="chart-nrrsrq"></div>
+          </div>
+          <div class="kv signal-optional sig-nr-only" data-metric="nrsinr">
+            <div class="lbl">NR SINR</div>
+            <div class="val" id="sig-nrsinr">—</div>
+            <div class="signal-chart" id="chart-nrsinr"></div>
+          </div>
+        </div>
+        <div class="signal-strip">
+          <span>RSSI <b id="sig-rssi">—</b></span>
+          <span>Ant <b id="sig-ant">—</b></span>
+          <span>Cell <b id="sig-cell-id">—</b></span>
+          <span>ENB <b><a id="sig-lteitaly" href="#" target="lteitaly">—</a></b></span>
+          <span>Band <b id="sig-band">—</b></span>
+          <span>BW <b id="sig-bw">—</b></span>
+          <span>PLMN <b id="sig-plmn">—</b></span>
+          <span>Allowed <b id="sig-allowed">—</b></span>
+        </div>
+        <div class="signal-legend">
+          <span><span class="signal-legend-dot ok"></span>Buono</span>
+          <span><span class="signal-legend-dot warn"></span>Medio</span>
+          <span><span class="signal-legend-dot bad"></span>Basso</span>
+        </div>
+      </div>
       <div class="foot hide" id="errorFoot"></div>
+    </div>
+    <div class="install-row">
+      <button class="toggle-btn" id="installBtn" hidden>Installa app</button>
+    </div>
+  </div>
+  <div class="metric-modal" id="metricModal" hidden>
+    <div class="metric-panel">
+      <div class="metric-head">
+        <div>
+          <div class="metric-title" id="metricTitle">—</div>
+          <div class="metric-stats">
+            <span>Ultimo <b id="metricLast">—</b></span>
+            <span>Media <b id="metricAvg">—</b></span>
+            <span>Campioni <b id="metricCount">0</b></span>
+          </div>
+        </div>
+        <button class="toggle-btn" id="metricClose" type="button">Chiudi</button>
+      </div>
+      <svg id="metricChart" preserveAspectRatio="none"></svg>
     </div>
   </div>
 
 <script>
 const pollMs = {int(POLL_SECONDS*1000)};
-const maxPoints = Math.max(10, Math.floor(180000 / pollMs)); // ~3 minuti di storico
+const maxPoints = Math.max(30, Math.floor(180000 / pollMs)); // ~3 minuti di storico
+const signalMaxPoints = 80;
 const history = [];
+const signalHistory = [];
+let activeMetric = null;
 let timer = null;
 let paused = false;
 let deferredInstallPrompt = null;
+let routerPassword = '';
+let radioEnabled = false;
+let authCooldownUntil = 0;
 
 function isStandalone() {{
   return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
@@ -571,6 +861,27 @@ window.addEventListener('appinstalled', () => {{
   updateInstallButton();
 }});
 
+const routerForgetBtn = document.getElementById('routerForgetBtn');
+const showRadioBtn = document.getElementById('showRadioBtn');
+const hideRadioBtn = document.getElementById('hideRadioBtn');
+if (showRadioBtn) {{
+  showRadioBtn.addEventListener('click', () => {{
+    if (ensureRouterPassword()) {{
+      setRadioEnabled(true);
+    }}
+  }});
+}}
+if (hideRadioBtn) {{
+  hideRadioBtn.addEventListener('click', () => setRadioEnabled(false));
+}}
+if (routerForgetBtn) {{
+  routerForgetBtn.addEventListener('click', () => {{
+    saveRouterPassword('');
+    setRadioEnabled(false);
+    renderSignal({{ error: 'Accesso router dimenticato.' }});
+  }});
+}}
+
 if ('serviceWorker' in navigator) {{
   window.addEventListener('load', () => {{
     navigator.serviceWorker.register('/sw.js').catch((error) => {{
@@ -581,6 +892,346 @@ if ('serviceWorker' in navigator) {{
 
 const num = (n) => Number(n || 0);
 const fmt = (n) => num(n).toFixed(2);
+const fmtSignal = (v) => (v === null || v === undefined || v === '') ? '—' : String(v);
+function fmtBars(value) {{
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fmtSignal(value);
+  const capped = Math.max(0, Math.min(5, Math.round(n)));
+  return '▰'.repeat(capped) + '▱'.repeat(5 - capped);
+}}
+const toSignalNumber = (v) => {{
+  if (v === null || v === undefined || v === '') return null;
+  const match = String(v).replace(',', '.').match(/-?[0-9]+([.][0-9]+)?/);
+  const parsed = match ? Number(match[0]) : NaN;
+  return Number.isFinite(parsed) ? parsed : null;
+}};
+
+const metricDefs = {{
+  rsrp: {{ label: 'RSRP', min: -130, max: -60, unit: 'dBm' }},
+  rsrq: {{ label: 'RSRQ', min: -16, max: -3, unit: 'dB' }},
+  sinr: {{ label: 'SINR', min: 0, max: 24, unit: 'dB' }},
+  nrrsrp: {{ label: 'NR RSRP', min: -130, max: -60, unit: 'dBm' }},
+  nrrsrq: {{ label: 'NR RSRQ', min: -16, max: -3, unit: 'dB' }},
+  nrsinr: {{ label: 'NR SINR', min: 0, max: 24, unit: 'dB' }},
+}};
+
+function updateNrVisibility() {{
+  const nrCharts = Array.from(document.querySelectorAll('.sig-nr-only'));
+  const hasNr = signalHistory.some((point) => point.nrrsrp !== null || point.nrrsrq !== null || point.nrsinr !== null);
+  nrCharts.forEach((el) => {{
+    el.classList.toggle('sig-hidden', !hasNr);
+  }});
+}}
+
+function loadRadioPreferences() {{
+  try {{
+    radioEnabled = localStorage.getItem('radioEnabled') === '1' && !!routerPassword;
+  }} catch (_) {{
+    radioEnabled = false;
+  }}
+  updateRadioPanel();
+  updateNrVisibility();
+}}
+
+function setRadioEnabled(enabled) {{
+  radioEnabled = !!enabled;
+  try {{ localStorage.setItem('radioEnabled', radioEnabled ? '1' : '0'); }} catch (_) {{}}
+  updateRadioPanel();
+  if (radioEnabled) {{
+    updateRouterLoginState(routerPassword ? 'Dati radio autenticati.' : 'Accesso router richiesto.');
+    tick();
+  }}
+}}
+
+function updateRadioPanel() {{
+  const panel = document.getElementById('radioPanel');
+  const showBtn = document.getElementById('showRadioBtn');
+  const badge = document.getElementById('networkBadge');
+  if (panel) panel.hidden = !radioEnabled;
+  if (showBtn) showBtn.hidden = radioEnabled;
+  if (badge && !radioEnabled) badge.hidden = true;
+}}
+
+function loadRouterPassword() {{
+  try {{
+    routerPassword = sessionStorage.getItem('routerPassword') || '';
+  }} catch (_) {{
+    routerPassword = '';
+  }}
+  updateRouterLoginState(routerPassword ? 'Accesso router in sessione.' : 'Accesso router non inserito.');
+}}
+
+function saveRouterPassword(value) {{
+  routerPassword = value || '';
+  try {{
+    if (routerPassword) sessionStorage.setItem('routerPassword', routerPassword);
+    else sessionStorage.removeItem('routerPassword');
+  }} catch (_) {{}}
+  updateRouterLoginState(routerPassword ? 'Accesso router in sessione.' : 'Accesso router dimenticato.');
+}}
+
+function ensureRouterPassword() {{
+  if (Date.now() < authCooldownUntil) {{
+    const seconds = Math.ceil((authCooldownUntil - Date.now()) / 1000);
+    updateRouterLoginState('Riprova tra ' + seconds + 's: il router ha bloccato troppi tentativi.');
+    return false;
+  }}
+  if (routerPassword) return true;
+  const value = window.prompt('Password router');
+  if (!value) {{
+    updateRouterLoginState('Accesso router non inserito.');
+    return false;
+  }}
+  saveRouterPassword(value);
+  return true;
+}}
+
+function updateRouterLoginState(text) {{
+  const el = document.getElementById('routerLoginState');
+  if (el) el.textContent = text;
+}}
+
+function isRouterPasswordError(error) {{
+  const text = String(error || '').toLowerCase();
+  return text.includes('108007') || text.includes('108006') || text.includes('password') || text.includes('login');
+}}
+
+function stopRadioForPasswordError(error) {{
+  authCooldownUntil = Date.now() + 60000;
+  saveRouterPassword('');
+  setRadioEnabled(false);
+  renderSignal({{ error: 'Accesso router fallito.' }});
+  updateRouterLoginState('Password errata o troppi tentativi. Riprova tra 60s.');
+}}
+
+function signalHeaders() {{
+  return routerPassword ? {{ 'X-Router-Password': routerPassword }} : {{}};
+}}
+
+function drawSignalBars(containerId, rawValues, min, max) {{
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  const source = Array.isArray(rawValues) ? rawValues : [];
+  const w = Math.max(1, container.clientWidth || 220);
+  const h = 36;
+  const padTop = 2;
+  const lineW = 3;
+  const gap = 2;
+  const scaleMin = min;
+  const scaleMax = max;
+  if (!source.length) {{
+    container.innerHTML = '<svg version=\"1.1\" viewBox=\"0 0 ' + w + ' ' + h + '\" width=\"' + w + '\" height=\"' + h + '\" preserveAspectRatio=\"none\"><text x=\"6\" y=\"24\" fill=\"#94a3b8\" font-size=\"11\">—</text></svg>';
+    return;
+  }}
+  const values = source.map((v) => (Number.isFinite(v) ? v : null));
+  const hasVal = values.some((v) => v !== null);
+  if (!hasVal) {{
+    container.innerHTML = '<svg version=\"1.1\" viewBox=\"0 0 ' + w + ' ' + h + '\" width=\"' + w + '\" height=\"' + h + '\" preserveAspectRatio=\"none\"><text x=\"6\" y=\"24\" fill=\"#94a3b8\" font-size=\"11\">—</text></svg>';
+    return;
+  }}
+  const denom = Math.max(scaleMax - scaleMin, 1);
+  const step = lineW + gap;
+  let svg = '<svg version=\"1.1\" viewBox=\"0 0 ' + w + ' ' + h + '\" width=\"' + w + '\" height=\"' + h + '\" preserveAspectRatio=\"none\" style=\"display:block\">';
+  for (let i = 0; i < values.length; i++) {{
+    const value = values[i];
+    const x = 4 + step * i;
+    if (x > w - 2) break;
+    const baseY = h - 1;
+    let y = baseY;
+    if (value !== null) {{
+      const bounded = Math.max(scaleMin, Math.min(scaleMax, value));
+      y = padTop + (h - padTop * 2) * (1 - ((bounded - scaleMin) / denom));
+    }}
+    const ratio = value === null ? 0 : ((value - scaleMin) / denom) * 100;
+    let color = '#64748b';
+    if (value !== null) {{
+      color = ratio < 50 ? '#f97316' : (ratio < 85 ? '#eab308' : '#22c55e');
+    }}
+    svg += '<line x1=\"' + x.toFixed(2) + '\" y1=\"' + baseY + '\" x2=\"' + x.toFixed(2) + '\" y2=\"' + y.toFixed(2) + '\" stroke=\"' + color + '\" stroke-width=\"' + lineW + '\"></line>';
+  }}
+  svg += '</svg>';
+  container.innerHTML = svg;
+}}
+
+function drawMetricLine(metricKey) {{
+  const svg = document.getElementById('metricChart');
+  const def = metricDefs[metricKey];
+  if (!svg || !def) return;
+
+  const samples = signalHistory
+    .map((point) => point[metricKey])
+    .filter((value) => Number.isFinite(value));
+
+  document.getElementById('metricTitle').textContent = def.label;
+  document.getElementById('metricCount').textContent = String(samples.length);
+
+  if (!samples.length) {{
+    document.getElementById('metricLast').textContent = '—';
+    document.getElementById('metricAvg').textContent = '—';
+    svg.innerHTML = '<text x="18" y="42" fill="#94a3b8" font-size="13">Nessun campione in sessione</text>';
+    return;
+  }}
+
+  const last = samples[samples.length - 1];
+  const avg = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+  document.getElementById('metricLast').textContent = last.toFixed(1) + def.unit;
+  document.getElementById('metricAvg').textContent = avg.toFixed(1) + def.unit;
+
+  const w = svg.clientWidth || 820;
+  const h = svg.clientHeight || 320;
+  const pad = 34;
+  const innerW = Math.max(1, w - pad * 2);
+  const innerH = Math.max(1, h - pad * 2);
+  const min = def.min;
+  const max = def.max;
+  const denom = Math.max(1, max - min);
+  const len = samples.length;
+
+  const pointString = samples.map((value, index) => {{
+    const bounded = Math.max(min, Math.min(max, value));
+    const x = pad + (len <= 1 ? 0 : (index / (len - 1)) * innerW);
+    const y = pad + innerH * (1 - ((bounded - min) / denom));
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }}).join(' ');
+
+  const avgY = pad + innerH * (1 - ((Math.max(min, Math.min(max, avg)) - min) / denom));
+  const grid = [];
+  for (let i = 0; i <= 4; i++) {{
+    const y = pad + (innerH / 4) * i;
+    const label = (max - (denom / 4) * i).toFixed(0);
+    grid.push('<line x1="' + pad + '" y1="' + y + '" x2="' + (pad + innerW) + '" y2="' + y + '" class="grid"/>');
+    grid.push('<text x="' + (pad - 8) + '" y="' + (y + 4) + '" class="label">' + label + '</text>');
+  }}
+
+  svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+  svg.innerHTML =
+    '<rect x="0" y="0" width="' + w + '" height="' + h + '" rx="8" class="chart-bg"/>' +
+    grid.join('') +
+    '<line x1="' + pad + '" y1="' + avgY.toFixed(1) + '" x2="' + (pad + innerW) + '" y2="' + avgY.toFixed(1) + '" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="5 5"/>' +
+    '<polyline points="' + pointString + '" fill="none" stroke="#60a5fa" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>';
+}}
+
+function openMetricModal(metricKey) {{
+  if (!metricDefs[metricKey]) return;
+  activeMetric = metricKey;
+  const modal = document.getElementById('metricModal');
+  if (modal) modal.hidden = false;
+  drawMetricLine(metricKey);
+}}
+
+function closeMetricModal() {{
+  activeMetric = null;
+  const modal = document.getElementById('metricModal');
+  if (modal) modal.hidden = true;
+}}
+
+function setupMetricModal() {{
+  document.querySelectorAll('[data-metric]').forEach((el) => {{
+    el.addEventListener('click', () => openMetricModal(el.getAttribute('data-metric')));
+  }});
+  const close = document.getElementById('metricClose');
+  const modal = document.getElementById('metricModal');
+  if (close) close.addEventListener('click', closeMetricModal);
+  if (modal) {{
+    modal.addEventListener('click', (event) => {{
+      if (event.target === modal) closeMetricModal();
+    }});
+  }}
+}}
+
+function renderSignalCharts() {{
+  const recent = signalHistory.slice(-signalMaxPoints);
+  const rsrpValues = recent.map((point) => point.rsrp);
+  const rsrqValues = recent.map((point) => point.rsrq);
+  const sinrValues = recent.map((point) => point.sinr);
+  const nrrsrpValues = recent.map((point) => point.nrrsrp);
+  const nrrsrqValues = recent.map((point) => point.nrrsrq);
+  const nrsinrValues = recent.map((point) => point.nrsinr);
+
+  drawSignalBars('chart-rsrp', rsrpValues, -130, -60);
+  drawSignalBars('chart-rsrq', rsrqValues, -16, -3);
+  drawSignalBars('chart-sinr', sinrValues, 0, 24);
+  drawSignalBars('chart-nrrsrp', nrrsrpValues, -130, -60);
+  drawSignalBars('chart-nrrsrq', nrrsrqValues, -16, -3);
+  drawSignalBars('chart-nrsinr', nrsinrValues, 0, 24);
+  updateNrVisibility();
+  if (activeMetric) drawMetricLine(activeMetric);
+}}
+
+function addSignalPoint(payload) {{
+  if (!payload || payload.error) return;
+  signalHistory.push({{
+    ts: Date.now(),
+    rsrp: toSignalNumber(payload.rsrp),
+    rsrq: toSignalNumber(payload.rsrq),
+    sinr: toSignalNumber(payload.sinr),
+    nrrsrp: toSignalNumber(payload.nrrsrp),
+    nrrsrq: toSignalNumber(payload.nrrsrq),
+    nrsinr: toSignalNumber(payload.nrsinr),
+  }});
+  renderSignalCharts();
+}}
+
+function renderSignal(payload) {{
+  const set = (id, value) => {{
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = fmtSignal(value);
+  }};
+
+  if (!payload || payload.error) {{
+    ['sig-rsrp','sig-rsrq','sig-sinr','sig-rssi','sig-bars','sig-network-mode','sig-nrrsrp','sig-nrrsrq','sig-nrsinr','sig-cell-id','sig-band','sig-bw','sig-plmn','sig-ant','sig-allowed'].forEach((id) => {{
+      set(id, '—');
+    }});
+    const link = document.getElementById('sig-lteitaly');
+    const badge = document.getElementById('networkBadge');
+    if (badge) badge.hidden = true;
+    if (link) {{
+      link.setAttribute('href', '#');
+      link.textContent = '—';
+    }}
+    if (payload && payload.error) {{
+      const status = document.getElementById('status');
+      status.textContent = 'Errore segnale: ' + payload.error;
+      status.classList.add('err');
+    }}
+    renderSignalCharts();
+    return;
+  }}
+
+  set('sig-rsrp', payload.rsrp);
+  set('sig-rsrq', payload.rsrq);
+  set('sig-sinr', payload.sinr);
+  set('sig-rssi', payload.rssi || '—');
+  set('sig-bars', payload.signal_icon ? fmtBars(payload.signal_icon) : (payload.signal_strength || '—'));
+  set('sig-network-mode', payload.mode === '4G+' ? '4G+' : '4G');
+  const badge = document.getElementById('networkBadge');
+  if (badge) badge.hidden = false;
+  set('sig-nrrsrp', payload.nrrsrp || '—');
+  set('sig-nrrsrq', payload.nrrsrq || '—');
+  set('sig-nrsinr', payload.nrsinr || '—');
+  set('sig-cell-id', payload.cell_id || '—');
+  set('sig-band', payload.band || '—');
+  const bwText = (payload.dlbandwidth || '') + (payload.dlbandwidth || payload.ulbandwidth ? '/' : '') + (payload.ulbandwidth || '');
+  set('sig-bw', bwText.replace(new RegExp('^/|/$', 'g'), '') || '—');
+  set('sig-plmn', payload.plmn || '—');
+  set('sig-ant', (payload.antenna1 || '--') + '/' + (payload.antenna2 || '--'));
+  set('sig-allowed', payload.allowed || '—');
+
+  const link = document.getElementById('sig-lteitaly');
+  if (link) {{
+    if (payload.lteitaly && payload.enbid) {{
+      link.setAttribute('href', payload.lteitaly);
+      link.textContent = String(payload.enbid);
+    }} else {{
+      link.setAttribute('href', '#');
+      link.textContent = payload.enbid ? String(payload.enbid) : '—';
+    }}
+  }}
+  const status = document.getElementById('status');
+  if (status) status.classList.remove('err');
+}}
 
 function addPoint(down, up) {{
   history.push({{ down, up }});
@@ -630,29 +1281,81 @@ function renderChart() {{
     (history.length ? '<polyline points="' + points('up') + '" class="line ul"/>' : '');
 }}
 
-async function tick() {{
+async function fetchJsonWithTimeout(url, headers) {{
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.max(3500, pollMs * 2));
   try {{
-    const r = await fetch('/api/speed', {{ cache: 'no-store' }});
-    const j = await r.json();
-    const down = num(j.download_mbps);
-    const up = num(j.upload_mbps);
+    const response = await fetch(url, {{ cache: 'no-store', signal: controller.signal, headers: headers || {{}} }});
+    return await response.json();
+  }} finally {{
+    clearTimeout(timeout);
+  }}
+}}
 
-    document.getElementById('down').textContent = fmt(down) + ' Mbps';
-    document.getElementById('up').textContent = fmt(up) + ' Mbps';
-    const status = document.getElementById('status');
+async function tick() {{
+  const status = document.getElementById('status');
+  const foot = document.getElementById('errorFoot');
+
+  const requests = [fetchJsonWithTimeout('/api/speed')];
+  if (radioEnabled) {{
+    requests.push(fetchJsonWithTimeout('/api/signal', signalHeaders()));
+  }}
+  const results = await Promise.allSettled(requests);
+  const speedResult = results[0];
+  const signalResult = radioEnabled ? results[1] : null;
+
+  let errors = [];
+
+  if (speedResult.status === 'fulfilled') {{
+    const j = speedResult.value;
+    if (j.error) {{
+      document.getElementById('down').textContent = '—';
+      document.getElementById('up').textContent = '—';
+      errors.push('speed: ' + j.error);
+    }} else {{
+      const down = num(j.download_mbps);
+      const up = num(j.upload_mbps);
+      document.getElementById('down').textContent = fmt(down) + ' Mbps';
+      document.getElementById('up').textContent = fmt(up) + ' Mbps';
+      addPoint(down, up);
+    }}
+  }} else {{
+    document.getElementById('down').textContent = '—';
+    document.getElementById('up').textContent = '—';
+    errors.push('speed: ' + speedResult.reason);
+  }}
+
+  if (!radioEnabled) {{
+    updateRouterLoginState('Dati radio disattivati.');
+  }} else if (signalResult.status === 'fulfilled') {{
+    const payload = signalResult.value;
+    renderSignal(payload);
+    addSignalPoint(payload);
+    if (payload.error) {{
+      errors.push('signal: ' + payload.error);
+      if (isRouterPasswordError(payload.error)) {{
+        stopRadioForPasswordError(payload.error);
+      }} else if (String(payload.error).includes('100003')) {{
+        updateRouterLoginState('Password richiesta dal router per i dati radio.');
+      }}
+    }} else {{
+      updateRouterLoginState(routerPassword ? 'Dati radio autenticati.' : 'Dati radio disponibili senza password.');
+    }}
+  }} else {{
+    renderSignal({{ error: String(signalResult.reason) }});
+    errors.push('signal: ' + signalResult.reason);
+  }}
+
+  if (errors.length) {{
+    status.textContent = 'Errore router';
+    status.classList.add('err');
+    foot.textContent = errors.join(' | ');
+    foot.classList.remove('hide');
+  }} else {{
     status.textContent = 'Ultimo aggiornamento: ' + new Date().toLocaleTimeString();
     status.classList.remove('err');
-    const foot = document.getElementById('errorFoot');
     foot.textContent = '';
     foot.classList.add('hide');
-    addPoint(down, up);
-  }} catch (e) {{
-    const status = document.getElementById('status');
-    status.textContent = 'Errore: ' + e;
-    status.classList.add('err');
-    const foot = document.getElementById('errorFoot');
-    foot.textContent = 'Errore di polling: ' + e;
-    foot.classList.remove('hide');
   }}
 }}
 
@@ -663,6 +1366,8 @@ async function loop() {{
   timer = setTimeout(loop, pollMs); // aspetta che la richiesta finisca per evitare sovrapposizioni
 }}
 
+loadRouterPassword();
+loadRadioPreferences();
 renderChart();
 loop();
 
@@ -704,6 +1409,8 @@ document.addEventListener('visibilitychange', () => {{
   }}
 }});
 
+setupMetricModal();
+renderSignalCharts();
 updateInstallButton();
 </script>
 </body>
